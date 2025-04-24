@@ -1,10 +1,14 @@
-from flask import Flask, jsonify, request, send_file, render_template
+from flask import Flask, jsonify, request, send_file, render_template, Response, stream_with_context
 import requests
 import pandas as pd
 import io
 import base64
 import re
 import os
+import json
+from queue import Queue
+from threading import Thread
+from collections import defaultdict
 
 from dotenv import load_dotenv
 
@@ -16,6 +20,9 @@ app = Flask(__name__)
 JIRA_URL = os.getenv("JIRA_URL")
 JIRA_USER = os.getenv("JIRA_USER")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+
+# 진행 상황을 저장할 전역 큐
+progress_queue = Queue()
 
 def get_jira_issue(issue_key):
     url = f"{JIRA_URL}/rest/api/3/issue/{issue_key}"
@@ -66,48 +73,182 @@ def extract_build_time(line):
 def index():
     return render_template("index.html")
 
-@app.route("/export", methods=["POST"])
-def export_from_log_text():
+@app.route("/start-processing", methods=["POST"])
+def start_processing():
     log_text = request.form.get("log_text", "")
     lines = log_text.splitlines()
+    
+    # 백그라운드에서 처리 시작
+    thread = Thread(target=process_log, args=(lines,))
+    thread.start()
+    
+    return jsonify({"status": "processing"})
 
+@app.route("/progress")
+def progress():
+    def generate():
+        while True:
+            progress = progress_queue.get()
+            yield f"data: {json.dumps(progress)}\n\n"
+            if progress.get("complete"):
+                break
+    
+    return Response(generate(), mimetype="text/event-stream")
+
+def process_log(lines):
+    builds = defaultdict(lambda: {
+        'build_time': '',
+        'issues': [],
+        'comments': [],
+        'assignees': set(),
+        'reporters': set(),
+        'approvers': set()
+    })
+    
     current_build = ""
-    current_time = ""
-    data = []
-
+    total_lines = len(lines)
+    processed_lines = 0
+    
     for line in lines:
+        processed_lines += 1
+        progress = int((processed_lines / total_lines) * 100)
+        progress_queue.put({"progress": progress})
+        
         build_number = extract_build_number(line)
         if build_number:
             current_build = build_number
-            current_time = extract_build_time(line)
+            builds[current_build]['build_time'] = extract_build_time(line)
             continue
-
+            
+        if not current_build:  # 빌드 번호가 없는 라인은 스킵
+            continue
+            
         issue_keys = extract_issue_keys(line)
-        for key in issue_keys:
-            issue_info = get_jira_issue(key)
-            data.append({
-                "build_number": current_build,
-                "build_time": current_time,
-                "issue_key": key,
-                "jira_link": f"{JIRA_URL}/browse/{key}",
-                "comment": line.strip(),
-                "assignee": issue_info.get("assignee"),
-                "reporter": issue_info.get("reporter"),
-                "created": issue_info.get("created"),
-                "approver": issue_info.get("approver_name"),
-                "approval_time": issue_info.get("approval_time")
-            })
+        if issue_keys:
+            builds[current_build]['comments'].append(line.strip())
+            for key in issue_keys:
+                builds[current_build]['issues'].append(key)
+                issue_info = get_jira_issue(key)
+                if issue_info.get('assignee'):
+                    builds[current_build]['assignees'].add(issue_info.get('assignee'))
+                if issue_info.get('reporter'):
+                    builds[current_build]['reporters'].add(issue_info.get('reporter'))
+                if issue_info.get('approver_name'):
+                    builds[current_build]['approvers'].add(issue_info.get('approver_name'))
 
-    df = pd.DataFrame(data)
-    csv_buffer = io.StringIO()
-    df.to_csv(csv_buffer, index=False)
-    csv_buffer.seek(0)
-    return send_file(
-        io.BytesIO(csv_buffer.getvalue().encode()),
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name="manual_jira_report.csv"
-    )
+    # 데이터를 DataFrame 형식에 맞게 변환
+    data = []
+    for build_number, build_info in builds.items():
+        data.append({
+            "build_number": build_number,
+            "build_time": build_info['build_time'],
+            "issue_keys": ', '.join(build_info['issues']),
+            "jira_links": ', '.join([f"{JIRA_URL}/browse/{key}" for key in build_info['issues']]),
+            "comments": '\n'.join(build_info['comments']),
+            "assignees": ', '.join(build_info['assignees']),
+            "reporters": ', '.join(build_info['reporters']),
+            "approvers": ', '.join(build_info['approvers'])
+        })
+
+    # 처리 완료 알림
+    progress_queue.put({"progress": 100, "complete": True})
+    
+    return data
+
+@app.route("/export", methods=["POST"])
+def export_from_log_text():
+    def generate():
+        log_text = request.form.get("log_text", "")
+        lines = log_text.splitlines()
+        
+        builds = defaultdict(lambda: {
+            'build_time': '',
+            'issue_key': '',
+            'comment': '',
+            'assignee': '',
+            'reporter': '',
+            'approver': '',
+            'approval_time': ''
+        })
+        
+        current_build = ""
+        total_lines = len(lines)
+        processed_lines = 0
+        
+        yield f"data: {json.dumps({'progress': 0})}\n\n"
+        
+        for line in lines:
+            processed_lines += 1
+            progress = int((processed_lines / total_lines) * 100)
+            
+            if progress % 5 == 0:
+                yield f"data: {json.dumps({'progress': progress})}\n\n"
+            
+            build_number = extract_build_number(line)
+            if build_number:
+                current_build = build_number
+                builds[current_build]['build_time'] = extract_build_time(line)
+                continue
+                
+            if not current_build:
+                continue
+                
+            # 이미 이슈가 있는 빌드는 스킵
+            if builds[current_build]['issue_key']:
+                continue
+                
+            issue_keys = extract_issue_keys(line)
+            if issue_keys:
+                # 첫 번째 이슈만 사용
+                key = issue_keys[0]
+                issue_info = get_jira_issue(key)
+                builds[current_build].update({
+                    'issue_key': key,
+                    'comment': line.strip(),
+                    'assignee': issue_info.get('assignee', ''),
+                    'reporter': issue_info.get('reporter', ''),
+                    'approver': issue_info.get('approver_name', ''),
+                    'approval_time': issue_info.get('approval_time', '')
+                })
+
+        # 데이터를 DataFrame 형식으로 변환
+        data = []
+        for build_number, build_info in builds.items():
+            if build_info['issue_key']:  # 이슈가 있는 빌드만 포함
+                data.append({
+                    "build_number": build_number,
+                    "build_time": build_info['build_time'],
+                    "issue_key": build_info['issue_key'],
+                    "jira_link": f"{JIRA_URL}/browse/{build_info['issue_key']}",
+                    "comment": build_info['comment'],
+                    "assignee": build_info['assignee'],
+                    "reporter": build_info['reporter'],
+                    "approver": build_info['approver'],
+                    "approval_time": build_info['approval_time']
+                })
+
+        # DataFrame 생성 및 CSV 변환
+        df = pd.DataFrame(data)
+        columns = [
+            "build_number",
+            "build_time",
+            "issue_key",
+            "jira_link",
+            "comment",
+            "assignee",
+            "reporter",
+            "approver",
+            "approval_time"
+        ]
+        df = df[columns]
+        
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False)
+        csv_data = csv_buffer.getvalue()
+
+        yield f"data: {json.dumps({'progress': 100, 'complete': True, 'csv_data': csv_data})}\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=8084)

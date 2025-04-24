@@ -32,15 +32,104 @@
     button:hover {
       background-color: #0056b3;
     }
+    .progress-container {
+      margin-top: 1em;
+      display: none;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 20px;
+      background-color: #f0f0f0;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .progress {
+      width: 0%;
+      height: 100%;
+      background-color: #4CAF50;
+      transition: width 0.3s ease;
+    }
+    #progress-text {
+      margin-top: 0.5em;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Jenkins → Jira 감사 CSV 생성기</h1>
-    <form method="POST" action="/export">
+    <form id="exportForm">
         <textarea name="log_text" rows="20" cols="80" placeholder="여기에 커밋 로그 붙여넣기"></textarea><br>
         <button type="submit">CSV 생성</button>
-      </form>
+    </form>
+    <div class="progress-container" id="progressContainer">
+      <div class="progress-bar">
+        <div class="progress" id="progressBar"></div>
+      </div>
+      <div id="progress-text">처리중... 0%</div>
+    </div>
   </div>
+
+  <script>
+    document.getElementById('exportForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        
+        const form = e.target;
+        const progressContainer = document.getElementById('progressContainer');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progress-text');
+        
+        // 프로그레스 바 초기화 및 표시
+        progressContainer.style.display = 'block';
+        progressBar.style.width = '0%';
+        
+        // POST 요청으로 처리 시작
+        const response = await fetch('/export', {
+            method: 'POST',
+            body: new FormData(form)
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        while (true) {
+            const {value, done} = await reader.read();
+            if (done) break;
+            
+            const text = decoder.decode(value);
+            const messages = text.split('\n\n');
+            
+            for (const message of messages) {
+                if (message.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(message.slice(6));
+                        
+                        if (data.progress) {
+                            progressBar.style.width = `${data.progress}%`;
+                            progressText.textContent = `처리중... ${data.progress}%`;
+                        }
+                        
+                        if (data.complete && data.csv_data) {
+                            // CSV 다운로드
+                            const blob = new Blob([data.csv_data], { type: 'text/csv;charset=utf-8;' });
+                            const url = window.URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = 'manual_jira_report.csv';
+                            document.body.appendChild(a);
+                            a.click();
+                            window.URL.revokeObjectURL(url);
+                            a.remove();
+                            
+                            // 프로그레스 바 숨기기
+                            progressContainer.style.display = 'none';
+                        }
+                    } catch (e) {
+                        console.error('Failed to parse message:', e);
+                    }
+                }
+            }
+        }
+    });
+  </script>
 </body>
 </html>
