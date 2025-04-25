@@ -9,6 +9,8 @@ import json
 from queue import Queue
 from threading import Thread
 from collections import defaultdict
+import tempfile
+from werkzeug.utils import secure_filename
 
 from dotenv import load_dotenv
 
@@ -23,6 +25,9 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
 # 진행 상황을 저장할 전역 큐
 progress_queue = Queue()
+
+# 임시 파일을 저장할 디렉토리 설정
+TEMP_DIR = tempfile.gettempdir()
 
 def get_jira_issue(issue_key):
     url = f"{JIRA_URL}/rest/api/3/issue/{issue_key}"
@@ -155,8 +160,8 @@ def process_log(lines):
     
     return data
 
-@app.route("/export", methods=["POST"])
-def export_from_log_text():
+@app.route("/process", methods=["POST"])
+def process_log_text():
     def generate():
         log_text = request.form.get("log_text", "")
         lines = log_text.splitlines()
@@ -193,13 +198,11 @@ def export_from_log_text():
             if not current_build:
                 continue
                 
-            # 이미 이슈가 있는 빌드는 스킵
             if builds[current_build]['issue_key']:
                 continue
                 
             issue_keys = extract_issue_keys(line)
             if issue_keys:
-                # 첫 번째 이슈만 사용
                 key = issue_keys[0]
                 issue_info = get_jira_issue(key)
                 builds[current_build].update({
@@ -214,7 +217,7 @@ def export_from_log_text():
         # 데이터를 DataFrame 형식으로 변환
         data = []
         for build_number, build_info in builds.items():
-            if build_info['issue_key']:  # 이슈가 있는 빌드만 포함
+            if build_info['issue_key']:
                 data.append({
                     "build_number": build_number,
                     "build_time": build_info['build_time'],
@@ -227,7 +230,6 @@ def export_from_log_text():
                     "approval_time": build_info['approval_time']
                 })
 
-        # DataFrame 생성 및 CSV 변환
         df = pd.DataFrame(data)
         columns = [
             "build_number",
@@ -242,13 +244,42 @@ def export_from_log_text():
         ]
         df = df[columns]
         
-        csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False)
-        csv_data = csv_buffer.getvalue()
+        # 임시 파일로 저장
+        temp_file = tempfile.NamedTemporaryFile(
+            mode='w',
+            suffix='.csv',
+            delete=False,
+            dir=TEMP_DIR
+        )
+        
+        df.to_csv(temp_file.name, index=False)
+        filename = os.path.basename(temp_file.name)
 
-        yield f"data: {json.dumps({'progress': 100, 'complete': True, 'csv_data': csv_data})}\n\n"
+        yield f"data: {json.dumps({'progress': 100, 'complete': True, 'filename': filename})}\n\n"
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+@app.route("/download/<filename>")
+def download_csv(filename):
+    try:
+        filepath = os.path.join(TEMP_DIR, secure_filename(filename))
+        
+        @after_this_request
+        def remove_file(response):
+            try:
+                os.remove(filepath)
+            except Exception as e:
+                app.logger.error(f"Error removing file {filepath}: {e}")
+            return response
+            
+        return send_file(
+            filepath,
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name="manual_jira_report.csv"
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=8084)
